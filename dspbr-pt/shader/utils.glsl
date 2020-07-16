@@ -1,5 +1,5 @@
 /* @license
- * Copyright 2020  Dassault Systèmes - All Rights Reserved.
+ * Copyright 2020  Dassault Systemes - All Rights Reserved.
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -44,7 +44,11 @@ vec3 clamp_normal(vec3 n, vec3 ng, vec3 wi)
 // bottom (two-sided materials).
 void fix_normals(inout vec3 n, inout vec3 ng, in vec3 wi) {
     ng = dot(wi, ng) < 0.0 ? -ng : ng;
-    n = dot(n, ng) < 0.0 ? -n : n;
+    n = dot(wi, n) < 0.0 ? -n : n;
+}
+
+vec3 fix_normal(in vec3 n, in vec3 wi) {
+    return dot(n, wi) < 0.0 ? -n : n;
 }
 
 float sum(vec3 v) {

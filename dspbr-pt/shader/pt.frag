@@ -1,6 +1,6 @@
 #version 300 es
 /* @license
- * Copyright 2020  Dassault Systèmes - All Rights Reserved.
+ * Copyright 2020  Dassault Systemes - All Rights Reserved.
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -24,7 +24,7 @@ precision highp sampler2DArray;
 
 in vec2 v_uv;
 
-uniform float u_int_FrameCount;
+uniform int u_int_FrameCount;
 uniform uint u_int_MaxTextureSize; // used for data acessing of linear data in 2d textures
 uniform float u_float_FilmHeight;
 uniform float u_float_FocalLength;
@@ -34,7 +34,7 @@ uniform mat4 u_mat4_ViewMatrix;
 uniform uint u_int_NumTriangles;
 uniform int u_int_MaxBounceDepth;
 uniform bool u_bool_hasTangents;
-uniform bool u_bool_disableDirectShadows;
+uniform bool u_bool_forceIBLEvalOnLastBounce;
 
 uniform sampler2D u_sampler2D_PreviousTexture;
 
@@ -51,12 +51,13 @@ uniform sampler2D u_samplerCube_EnvMap;
 
 uniform int u_int_DebugMode;
 uniform bool u_bool_UseIBL;
+uniform bool u_bool_BackgroundFromIBL;
 
 out vec4 out_FragColor;
 
 struct MaterialData {
     // 0
-	vec3 albedo;
+    vec3 albedo;
     float metallic;
 
     //1
@@ -100,11 +101,17 @@ struct MaterialData {
     //9
     vec3 subsurfaceColor;
     int thinWalled;
+
+    //10
+    float translucency;
+    float alphaCutoff;
+    vec2 padding;
 };
 
 struct MaterialClosure {
     vec3 albedo;
     float transparency;
+    float cutout_opacity;
     float metallic;
     float specular;
     float f0;
@@ -118,11 +125,10 @@ struct MaterialClosure {
     vec3 sheen_color;
     vec2 alpha;
     float clearcoat;
-    float clearcoat_roughness;
+    float clearcoat_alpha;
     vec3 n;
     vec3 ng;
     vec3 t;
-    mat3 to_local;
 };
 
 // struct Light {
@@ -180,7 +186,6 @@ void fillRenderState(const in Ray r, const in HitInfo hit, out RenderState rs) {
     rs.normal = calculateInterpolatedNormal(triIdx, hit.uv);
 
     fix_normals(rs.normal, rs.geometryNormal, rs.wi);
-    rs.normal = clamp_normal(rs.normal, rs.geometryNormal, rs.wi);
 
     if(u_bool_hasTangents) {
         rs.tangent = normalize(calculateInterpolatedTangent(triIdx, hit.uv));
@@ -193,22 +198,30 @@ void fillRenderState(const in Ray r, const in HitInfo hit, out RenderState rs) {
     configure_material(matIdx, rs, rs.closure);
 }
 
-int sampleBSDFBounce(inout RenderState rs, inout vec3 pathWeight) {
-    //return -1;
-    float sample_pdf = 0.0;
-    vec3 sample_weight = vec3(0);
-    rs.wo = dspbr_sample(rs.closure, y_to_z_up * rs.wi, vec2(rng_NextFloat(), rng_NextFloat()), sample_weight, sample_pdf);
-
-    if(sample_pdf > 0.0) {
-        pathWeight *= sample_weight;
-        //pathWeight = rs.normal;
+int sampleBSDFBounce(inout RenderState rs, inout vec3 pathWeight, out uint eventType) {
+    Ray r;
+    float rr_cutout = rng_NextFloat();
+    if(rr_cutout > rs.closure.cutout_opacity) {
+      eventType |= EVENT_SPECULAR;
+      rs.wo = -rs.wi;
+      r = createRay(rs.wo, rs.hitPos + fix_normal(rs.geometryNormal, rs.wo) * EPS_NORMAL, TFAR_MAX);
     } else {
-        return -1;
+      float sample_pdf = 0.0;
+      vec3 sample_weight = vec3(0);
+
+      vec3 wi = y_to_z_up * rs.wi;
+      vec3 wo = dspbr_sample(rs.closure, wi, vec3(rng_NextFloat(), rng_NextFloat(), rng_NextFloat()), sample_weight, sample_pdf, eventType);
+      rs.wo = transpose(y_to_z_up) * wo;
+
+      if(sample_pdf > 0.0) {
+          pathWeight *= sample_weight;
+      } else {
+          return -1;
+      }
+      r = createRay(rs.wo, rs.hitPos + fix_normal(rs.geometryNormal, rs.wo) * EPS_NORMAL, TFAR_MAX);
     }
 
-    Ray r = createRay(rs.wo, rs.hitPos + rs.geometryNormal * EPS_NORMAL, TFAR_MAX);
     HitInfo hit;
-
     if (intersectScene_Nearest(r, hit)) {
         fillRenderState(r, hit, rs);
         return 1;
@@ -295,6 +308,9 @@ vec3 traceDebug(const Ray r) {
             mat3 onb = get_onb(rs.closure.n, rs.closure.t);
             color = onb[1];
         }
+         if(u_int_DebugMode== 7) {            
+            color = vec3(rs.closure.transparency);
+        }
     }    
     else { // direct background hit
         if(u_bool_UseIBL) {
@@ -306,6 +322,12 @@ vec3 traceDebug(const Ray r) {
     return color;
 }
 
+vec3 sampleIBL(in vec3 dir) {
+    if(u_bool_UseIBL) { 
+        return texture(u_samplerCube_EnvMap, mapDirToUV(dir)).xyz;
+    }
+    return vec3(0);
+}
 
 vec3 trace(const Ray r) {
     HitInfo hit;
@@ -316,34 +338,49 @@ vec3 trace(const Ray r) {
     if (intersectScene_Nearest(r, hit)) { // primary camera ray
         RenderState rs;
         fillRenderState(r, hit, rs);
-           
-        for (int depth = 0; depth < u_int_MaxBounceDepth; depth++) {
+
+        int i = 0;
+        bool lastBounceSpecular = false;
+        while(i < u_int_MaxBounceDepth || lastBounceSpecular) { 
+            // start russion roulette path termination for bounce depth > 2
+            if(i>2 && rng_NextFloat() > RR_TERMINATION_PROB) { 
+                if(u_bool_forceIBLEvalOnLastBounce)
+                    color += sampleIBL(rs.wo) * pathWeight;
+                break;
+            }
+
 #ifdef HAS_LIGHTS
             color += (rs.closure.emission + sampleAndEvaluateDirectLight(rs)) * pathWeight;
 #else
             color += rs.closure.emission * pathWeight;
 #endif
 
-            int bounceType = sampleBSDFBounce(rs, pathWeight); // generate sample and proceed with next intersection
+            uint eventType = 0u;
+            int bounceType = sampleBSDFBounce(rs, pathWeight, eventType); // generate sample and proceed with next intersection
+            if(bounceType == -1) break; // absorbed
 
-            if (bounceType == -1) { // absorbed
-                break;
+            if(i>2) {
+                pathWeight *= 1.0 / RR_TERMINATION_PROB;
             }
 
-            if (bounceType == 0  || (depth == 0 && u_bool_disableDirectShadows)) { // background
-                if(u_bool_UseIBL) {
-                     color += texture(u_samplerCube_EnvMap, mapDirToUV(rs.wo)).xyz * pathWeight ;
-                }
+            lastBounceSpecular = bool(eventType & EVENT_SPECULAR);
+
+            bool isPathEnd = (i == (u_int_MaxBounceDepth-1));
+            bool forcedIBLSampleOnPathEnd = (isPathEnd && u_bool_forceIBLEvalOnLastBounce);
+            if ( bounceType == 0 || forcedIBLSampleOnPathEnd) { // background sample
+                color += sampleIBL(rs.wo) * pathWeight;
                 break;
             }
 
             // all clear - next sample has properly been generated and intersection was found. Render state contains new intersection info.
+            i++;
         }
     } 
     else { // direct background hit
-        if(u_bool_UseIBL) {
-            vec2 uv = mapDirToUV(r.dir);
-            color =  texture(u_samplerCube_EnvMap, uv).xyz;
+        if(u_bool_BackgroundFromIBL) {
+            color = sampleIBL(r.dir);
+        } else {
+          color = vec3(1,1,1);
         }
     }
 
@@ -367,7 +404,7 @@ Ray calcuateRay(float r0, float r1) {
 }
 
 void main() {
-    init_RNG(int(u_int_FrameCount));
+    init_RNG(u_int_FrameCount);
 
     Ray r = calcuateRay(rng_NextFloat(), rng_NextFloat());
     
@@ -377,7 +414,7 @@ void main() {
         color = traceDebug(r);
 
     vec3 previousFrameColor = texelFetch(u_sampler2D_PreviousTexture,  ivec2(gl_FragCoord.xy), 0).xyz;
-    color = (previousFrameColor * (u_int_FrameCount-1.0) + color) / u_int_FrameCount;
+    color = (previousFrameColor * float(u_int_FrameCount-1) + color) / float(u_int_FrameCount);
 
     //color = texelFetch(u_sampler2D_LightData, getStructParameterTexCoord(0u, 0u, LIGHT_SIZE), 0).xyz;
     out_FragColor = vec4(color, 1);

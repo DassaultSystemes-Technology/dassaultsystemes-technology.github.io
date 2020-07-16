@@ -1,5 +1,5 @@
 /* @license
- * Copyright 2020  Dassault Systèmes - All Rights Reserved.
+ * Copyright 2020  Dassault Systemes - All Rights Reserved.
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -69,6 +69,10 @@ void unpackMaterialData(in uint idx, out MaterialData matData) {
     val = texelFetch(u_sampler2D_MaterialData, getStructParameterTexCoord(idx, 9u, MATERIAL_SIZE), 0);
     matData.subsurfaceColor = val.xyz;
     matData.thinWalled = int(val.w);
+
+    val = texelFetch(u_sampler2D_MaterialData, getStructParameterTexCoord(idx,10u, MATERIAL_SIZE), 0);
+    matData.translucency = val.x;
+    matData.alphaCutoff = val.y;
 }
 
 TexInfo getTextureInfo(ivec2 texInfoIdx, ivec2 transformInfoIdx) {
@@ -107,13 +111,12 @@ void unpackMaterialTexInfo(in uint idx, out MaterialTextureInfo matTexInfo) {
     matTexInfo.specularMap = getTextureInfo(specularTexInfoIdx, specularTexTransformsIdx);
 }
 
-// Convert from EVisuPBR roughness and anisotropy to 2d anisotropy.
+// Convert from roughness and anisotropy to 2d anisotropy.
 vec2 roughness_conversion(float roughness, float anisotropy)
 {
     vec2 a = vec2(roughness, roughness * (1.0 - anisotropy));
     return max(a*a, vec2(MINIMUM_ROUGHNESS));
 }
-
 
 void configure_material(const in uint matIdx, inout RenderState rs, out MaterialClosure c)
 {
@@ -125,8 +128,19 @@ void configure_material(const in uint matIdx, inout RenderState rs, out Material
     unpackMaterialData(matIdx, matData);
     unpackMaterialTexInfo(matIdx, matTexInfo);
     
-    c.albedo = matData.albedo * pow(evaluateMaterialTextureValue(matTexInfo.albedoMap, rs.uv0).xyz, vec3(2.2));
+    vec4 albedo = evaluateMaterialTextureValue(matTexInfo.albedoMap, rs.uv0);
+    c.albedo = matData.albedo * pow(albedo.xyz, vec3(2.2));
 
+    c.cutout_opacity = matData.cutoutOpacity * albedo.w;
+    if(matData.alphaCutoff > 0.0) { // MASK
+      c.cutout_opacity = step(matData.alphaCutoff, c.cutout_opacity); 
+    }
+    if(matData.alphaCutoff == 1.0) { // OPAQUE
+      c.cutout_opacity = 1.0;
+    }
+    
+    c.transparency = matData.transparency;
+    
     vec4 occlusionMetallicRoughness = evaluateMaterialTextureValue(matTexInfo.metallicRoughnessMap, uv);
     c.metallic = matData.metallic * occlusionMetallicRoughness.z;
     float roughness = matData.roughness * occlusionMetallicRoughness.y;
@@ -154,18 +168,21 @@ void configure_material(const in uint matIdx, inout RenderState rs, out Material
         vec3 n = normalize(evaluateMaterialTextureValue(matTexInfo.normalMap, uv).xyz * 2.0 - vec3(1.0));
         c.n = to_world * n;
         vec3 wi = y_to_z_up*rs.wi;
-        fix_normals(c.n, c.ng, wi);
-        c.n = clamp_normal(c.n, c.ng, wi);
-    }
-  
-    c.t = rotation_to_tangent(matData.anisotropyRotation, c.n, c.t);
 
-    c.to_local = transpose(get_onb(c.n, c.t));
+        // ensure n and ng point into the same hemisphere as wi
+        fix_normals(c.n, c.ng, wi);
+    }
+
+    // ensure orthonormal basis  
+    c.t = get_onb(c.n, c.t)[0];
+
+    // apply aniso rotation
+    c.t = rotation_to_tangent(matData.anisotropyRotation, c.n, c.t);
 
     c.emission = pow(evaluateMaterialTextureValue(matTexInfo.emissionMap, uv).xyz, vec3(2.2)) * matData.emission;
 
     c.clearcoat = matData.clearcoat;
-    c.clearcoat_roughness = max(matData.clearcoatRoughness, MINIMUM_ROUGHNESS);
+    c.clearcoat_alpha = max(matData.clearcoatRoughness*matData.clearcoatRoughness, MINIMUM_ROUGHNESS);
 }
 
 
